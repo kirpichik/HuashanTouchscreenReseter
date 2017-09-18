@@ -11,25 +11,15 @@
 #include <iostream>
 #include <string>
 #include <fstream>
-#include <map>
-#include <vector>
 #include <sstream>
 
 #include "config-manager.h"
-
-const std::string logFile = "log.log";
-
-int inputEventFile = -1;
 
 template<typename T>
 std::string toString(const T& value) {
     std::ostringstream oss;
     oss << value;
     return oss.str();
-}
-
-namespace tsr {
-  std::ofstream log;
 }
 
 /*void input() {
@@ -60,18 +50,20 @@ namespace tsr {
   }  
 }*/
 
-/** Вызов hw_reset у драйвера. */
-void callHwReset(std::string path) {
-  tsr::log << "[DAEMON] Calling hw-reset..." << std::endl;
+/** Вызов hw_reset у драйвера. 
+ * @param path Путь до каталога управления драйвером.
+ * */
+void callHwReset(const std::string& path) {
   std::ofstream output;
   output.open((path + "hw_reset").c_str());
   output << "1";
   output.close();
 }
 
-/** Вызов calibration у драйвера. */
-void callCalibration(std::string path) {
-  tsr::log << "[DAEMON] Calling calibration..." << std::endl;
+/** Вызов calibration у драйвера. 
+ * @param path Путь до каталога управления драйвером.
+ * */
+void callCalibration(const std::string& path) {
   std::ifstream input;
   input.open((path + "calibration").c_str());
   char c;
@@ -79,97 +71,74 @@ void callCalibration(std::string path) {
   input.close();
 }
 
-/** Ожидание события нажатия клавиши. */
-void waitButtonPress() {
+/** Ожидание события нажатия клавиши.
+ * @param inputEventFile Файл для ожидания событий.
+ * @param lightKey Код легкого нажатия кнопки камеры.
+ * @param fullKey Код полного нажатия кнопки камеры. 
+ * @return Код нажатой клавиши.
+ * */
+int waitButtonPress(int inputEventFile, int lightKey, int fullKey) {
   struct input_event event;
   
   while (1) {
     read(inputEventFile, &event, sizeof(struct input_event));
 
-    if (event.type == 1 && event.value)
-      return;
+    if (event.type == 1 && event.value && (event.code == lightKey || event.code == fullKey))
+      return event.code;
   }
 }
 
-/** Проверка включенного DEEP SLEEP MODE */
-bool isSleepModeEnabled(std::string path) {
+/** Проверка включенного DEEP SLEEP MODE 
+ * @param path Путь до каталога управления драйвером.
+ * @return true, если DEEP SLEEP MODE активен. 
+ * */
+bool isSleepModeEnabled(const std::string& path) {
   std::ifstream input;
   input.open((path + "sleep_status").c_str());
   std::string line;
   std::getline(input, line);
   input.close();
-  return line.length() == std::string("Deep Sleep is ENABLED").length();
+  return line.length() == 21; // Эквивалентно: "Deep Sleep is ENABLED".length
 }
 
 /** Ожидание выключения DEEP SLEEP MODE */
-void waitExitSleepMode(std::string path) {
+/*void waitExitSleepMode(std::string path) {
   while(1) {
-    //tsr::log << "[DAEMON] Waiting screen fully enabled..." << std::endl;
     if (!isSleepModeEnabled(path))
       return;
     sleep(1); // TODO - Уменьшить время перепроверки.
   }
-}
+}*/
 
-int workProcess(std::string driverPath, unsigned int eventId, bool needHwReset) {
+int workProcess(std::string driverPath, int eventId, int lightKey, int fullKey) {
 
-  inputEventFile = open((std::string("/dev/input/event") + toString(eventId)).c_str(), O_RDONLY);
-
-  tsr::log << "[DAEMON] Running..." << std::endl;
+  int inputEventFile = open(("/dev/input/event" + toString(eventId)).c_str(), O_RDONLY);
 
   while(1) {
-    waitButtonPress();
-    
-    //tsr::log << "[DAEMON] Catched button touch." << std::endl;
+    int key = waitButtonPress(inputEventFile, lightKey, fullKey);
 
-    if (!isSleepModeEnabled(driverPath)) {
-      //tsr::log << "[DAEMON] Sleep mode is DISABLED, ignoring it." << std::endl;
+    if (isSleepModeEnabled(driverPath))
       continue;
+    
+    if (key == fullKey) {
+      callHwReset(driverPath);
+      sleep(1);
     }
-
-    waitExitSleepMode(driverPath);
-
-    //callHwReset(driverPath);
 
     callCalibration(driverPath);
   }
 
-  close(inputEventFile);
-
-  tsr::log << "[DAEMON] Finished." << std::endl;
+  //close(inputEventFile); ?
 
   return 0;
 }
 
-int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cout << "Usage: ./touchsreen-reseter filename.conf" << std::endl;
-    return 1;
-  }
+/** Рабочий режим */
+int workMode(std::string driverPath, int eventId, int lightKey, int fullKey) {
+  std::cout << "Work mode started." << std::endl;
   
-  config::Config* config = config::Config::loadConfig(argv[1]);
-  if (!config) {
-    std::cout << "Error: Load config failed." << std::endl;
-    return 1;
-  }
-
-  if (!config->has("driver-path") || !config->has("event-ID") || !config->has("need-hw-reset")) {
-    std::cout << "Wrong config." << std::endl;
-    return;
-  }
-
-  std::string driverPath = config->get("driver-path");
-  if (driverPath[driverPath.length() - 1] != '/')
-    driverPath += "/";
-  unsigned int eventId = atoi(config->get("event-ID").c_str());
-  bool needHwReset = config->get("need-hw-reset") == "true" ? true : false;
-
-  delete config;
-
-  std::cout << "Config loaded successfully." << std::endl;
-
+  // Начинаем запуск демона
   int pid = fork();
-
   if (pid == -1) { // Не удалось запустить потомка
     std::cout << "Start Daemon Error: " << strerror(errno) << std::endl;
     return 1;
@@ -185,25 +154,90 @@ int main(int argc, char** argv) {
     // к примеру с размонтированием дисков
     chdir("/");
 
+    std::cout << "Daemon started." << std::endl;
+
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
-    /*struct stat st;
-    if (stat(logsPath.c_str(), &st) == -1) {
-      mkdir(logsPath.c_str(), 0700);
-      // TODO - Check permissions.
-    }*/
-
-    tsr::log.open(logFile.c_str());
-    
-    int result = workProcess(driverPath, eventId, needHwReset);
-
-    tsr::log.close();
-    
-    return result;
+    return workProcess(driverPath, eventId, lightKey, fullKey);
   }
 
   return 0;
+}
+
+/** Режим отладки настроек конфига */
+int debugMode(std::string driverPath, int eventId, int lightKey, int fullKey) {
+  std::cout << "Debug mode started." << std::endl;
+  
+  struct stat st;
+  if (stat(driverPath.c_str(), &st) == -1) {
+    std::cout << "Cannot find driver-path." << std::endl;
+    return 1;
+  }
+  
+  std::cout << "Driver path found." << std::endl;
+
+  if (stat(("/dev/input/event" + toString(eventId)).c_str(), &st) == -1) {
+    std::cout << "Cannot find /dev/input/event" << eventId << std::endl;
+    return 1;
+  }
+
+  int inputEventFile = open(("/dev/input/event" + toString(eventId)).c_str(), O_RDONLY);
+  
+  std::cout << "Button test:" << std::endl;
+
+  while(1) {
+    int key = waitButtonPress(inputEventFile, lightKey, fullKey);
+
+    if (key == lightKey)
+      std::cout << "Light key touch" << std::endl;
+    else
+      std::cout << "Full key touch" << std::endl;
+  }
+
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::cout << "Usage: ./touchsreen-reseter filename.conf" << std::endl;
+    return 1;
+  }
+  
+  // Загружаем конфиг
+  config::Config* config = config::Config::loadConfig(argv[1]);
+  if (!config) {
+    std::cout << "Error: Load config failed." << std::endl;
+    return 1;
+  }
+
+  // Узнаем, в каком режиме нужно запуститься.
+  bool debug = config->has("debug") && config->get("debug") == "true";
+
+  // Проверяем наличие всех параметров в конфиге
+  if (!config->has("driver-path") 
+      || !config->has("event-ID") 
+      || !config->has("light-touch-key") 
+      || !config->has("full-touch-key")) {
+    std::cout << "Wrong config." << std::endl;
+    return 1;
+  }
+
+  // Получаем все параметры конфига
+  std::string driverPath = config->get("driver-path");
+  if (driverPath[driverPath.length() - 1] != '/')
+    driverPath += "/";
+  int eventId = atoi(config->get("event-ID").c_str());
+  int lightKey = atoi(config->get("light-touch-key").c_str());
+  int fullKey = atoi(config->get("full-touch-key").c_str());
+
+  std::cout << "Config loaded successfully." << std::endl;
+
+  int result = debug ? debugMode(driverPath, eventId, lightKey, fullKey) : workMode(driverPath, eventId, lightKey, fullKey);
+  
+  delete config;
+
+  return result;
 }
 
