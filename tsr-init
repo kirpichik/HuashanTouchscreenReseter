@@ -1,0 +1,15 @@
+#!/system/bin/sh
+
+RES_PATH=/sys/devices/i2c-3/3-0024/main_ttsp_core.cyttsp4_i2c_adapter/
+
+echo 1 > $RES_PATH"hw_reset"
+
+sleep 1
+
+cat $RES_PATH"calibration"
+
+killall touchscreen-reseter
+
+RES_PATH=/data/touchscreen-reseter/
+
+$RES_PATH"touchscreen-reseter" $RES_PATH"config.conf"
