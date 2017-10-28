@@ -7,6 +7,7 @@
 #include <sys/file.h>
 #include <errno.h>
 #include <wait.h>
+#include <pthread.h>
 
 #include <iostream>
 #include <string>
@@ -15,6 +16,26 @@
 
 #include "config-manager.h"
 
+const std::string CALIBRATION_ON_POWER_CONFIG = "calibration-on-power";
+
+// Код легкого нажатия кнопки камеры
+const int CAMERA_LIGHT_PRESS_KEY = 528;
+// Код полного нажатия кнопки камеры
+const int CAMERA_FULL_PRESS_KEY = 766;
+
+// Номер /dev/input/eventX для кнопки камеры
+const int CAMERA_EVENT_ID = 1;
+
+// Код нажатия кнопки питания
+const int POWER_PRESS_KEY = 116;
+
+// Номер /dev/input/eventX для кнопки питания
+const int POWER_EVENT_ID = 0;
+
+// Путь для манипуляций с драйвером
+const std::string DRIVER_PATH = "/sys/devices/i2c-3/3-0024/main_ttsp_core.cyttsp4_i2c_adapter/";
+
+
 template<typename T>
 std::string toString(const T& value) {
     std::ostringstream oss;
@@ -22,119 +43,138 @@ std::string toString(const T& value) {
     return oss.str();
 }
 
-/*void input() {
-  int file;
-  struct input_event event;
-
-  if(argc < 2) {
-    printf("usage: %s <event path> \n", argv[0]);
-    return 1;
-  }
-
-  file = open(argv[1], O_RDONLY);
-  while (1) {
-    read(file, &event, sizeof(struct input_event));
-
-    printf("[type=%i, code=%i, value=%i]\n", event.type, event.code, event.value);
-
-    if (event.type == 1) {
-      if (event.value) {
-        printf("1:%i\n", event.code);
-        fflush(stdout);
-      }
-      else {
-        printf("0:%i\n", event.code);
-        fflush(stdout);
-      }
-    }
-  }  
-}*/
-
-/** Вызов hw_reset у драйвера. 
- * @param path Путь до каталога управления драйвером.
+/** 
+ * Вызов hw_reset у драйвера.
  * */
-void callHwReset(const std::string& path) {
+void callHwReset() {
   std::ofstream output;
-  output.open((path + "hw_reset").c_str());
+  output.open((DRIVER_PATH + "hw_reset").c_str());
   output << "1";
   output.close();
 }
 
-/** Вызов calibration у драйвера. 
- * @param path Путь до каталога управления драйвером.
+/**
+ * Вызов calibration у драйвера. 
  * */
-void callCalibration(const std::string& path) {
+void callCalibration() {
   std::ifstream input;
-  input.open((path + "calibration").c_str());
+  input.open((DRIVER_PATH + "calibration").c_str());
   char c;
   input >> c;
   input.close();
 }
 
-/** Ожидание события нажатия клавиши.
+/**
+ * Ожидание события нажатия клавиши.
  * @param inputEventFile Файл для ожидания событий.
- * @param lightKey Код легкого нажатия кнопки камеры.
- * @param fullKey Код полного нажатия кнопки камеры. 
  * @return Код нажатой клавиши.
  * */
-int waitButtonPress(int inputEventFile, int lightKey, int fullKey) {
+int waitButtonPress(int inputEventFile) {
   struct input_event event;
   
   while (1) {
     read(inputEventFile, &event, sizeof(struct input_event));
 
-    if (event.type == 1 && event.value && (event.code == lightKey || event.code == fullKey))
+    if (event.type == 1 && event.value)
       return event.code;
   }
 }
 
-/** Проверка включенного DEEP SLEEP MODE 
- * @param path Путь до каталога управления драйвером.
+/**
+ * Проверка включенного DEEP SLEEP MODE 
  * @return true, если DEEP SLEEP MODE активен. 
  * */
-bool isSleepModeEnabled(const std::string& path) {
+bool isSleepModeEnabled() {
   std::ifstream input;
-  input.open((path + "sleep_status").c_str());
+  input.open((DRIVER_PATH + "sleep_status").c_str());
   std::string line;
   std::getline(input, line);
   input.close();
   return line.length() == 21; // Эквивалентно: "Deep Sleep is ENABLED".length
 }
 
-/** Ожидание выключения DEEP SLEEP MODE */
-/*void waitExitSleepMode(std::string path) {
+/**
+ * Ожидание выключения DEEP SLEEP MODE
+ * */
+void waitExitSleepMode() {
   while(1) {
-    if (!isSleepModeEnabled(path))
+    if (!isSleepModeEnabled())
       return;
-    sleep(1); // TODO - Уменьшить время перепроверки.
+    usleep(200000); // 200 миллисекунд
   }
-}*/
+}
 
-int workProcess(std::string driverPath, int eventId, int lightKey, int fullKey) {
+/**
+ * Поток для получения нажатия кнопки питания.
+ * */
+void* powerButtonThread(void*) {
+  int inputEventFile = open(("/dev/input/event" + toString(POWER_EVENT_ID)).c_str(), O_RDONLY);
 
-  int inputEventFile = open(("/dev/input/event" + toString(eventId)).c_str(), O_RDONLY);
+  while(true) {
+    int key = 0;
+    while(key != POWER_PRESS_KEY)
+      key = waitButtonPress(inputEventFile);
 
-  while(1) {
-    int key = waitButtonPress(inputEventFile, lightKey, fullKey);
-
-    if (isSleepModeEnabled(driverPath))
+    if (!isSleepModeEnabled())
       continue;
-    
-    if (key == fullKey) {
-      callHwReset(driverPath);
+
+    waitExitSleepMode();
+
+    usleep(500000);
+
+    callCalibration();
+
+  }
+
+  pthread_exit(0);
+  return NULL;
+}
+
+/**
+ * Поток для получения нажатия кнопки камеры.
+ * */
+void* cameraButtonThread(void*) {
+  int inputEventFile = open(("/dev/input/event" + toString(CAMERA_EVENT_ID)).c_str(), O_RDONLY);
+
+  while(true) {
+    int key = 0;
+    while(key != CAMERA_LIGHT_PRESS_KEY && key != CAMERA_FULL_PRESS_KEY)
+      key = waitButtonPress(inputEventFile);
+  
+    if (isSleepModeEnabled())
+      continue;
+
+    if (key == CAMERA_FULL_PRESS_KEY) {
+      callHwReset();
       sleep(1);
     }
 
-    callCalibration(driverPath);
+    callCalibration();
+
   }
 
-  //close(inputEventFile); ?
+  pthread_exit(0);
+  return NULL;
+}
+
+int workProcess(bool calibrationOnPower) {
+  pthread_t cameraThread;
+  pthread_t powerThread;
+
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+
+  pthread_create(&cameraThread, &attr, cameraButtonThread, NULL);
+
+  if (calibrationOnPower)
+    pthread_create(&powerThread, &attr, powerButtonThread, NULL);
+  
+  pthread_join(cameraThread, NULL);
 
   return 0;
 }
 
-/** Рабочий режим */
-int workMode(std::string driverPath, int eventId, int lightKey, int fullKey) {
+int workMode(bool calibrationOnPower) {
   std::cout << "Work mode started." << std::endl;
   
   // Начинаем запуск демона
@@ -160,40 +200,7 @@ int workMode(std::string driverPath, int eventId, int lightKey, int fullKey) {
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
-    return workProcess(driverPath, eventId, lightKey, fullKey);
-  }
-
-  return 0;
-}
-
-/** Режим отладки настроек конфига */
-int debugMode(std::string driverPath, int eventId, int lightKey, int fullKey) {
-  std::cout << "Debug mode started." << std::endl;
-  
-  struct stat st;
-  if (stat(driverPath.c_str(), &st) == -1) {
-    std::cout << "Cannot find driver-path." << std::endl;
-    return 1;
-  }
-  
-  std::cout << "Driver path found." << std::endl;
-
-  if (stat(("/dev/input/event" + toString(eventId)).c_str(), &st) == -1) {
-    std::cout << "Cannot find /dev/input/event" << eventId << std::endl;
-    return 1;
-  }
-
-  int inputEventFile = open(("/dev/input/event" + toString(eventId)).c_str(), O_RDONLY);
-  
-  std::cout << "Button test:" << std::endl;
-
-  while(1) {
-    int key = waitButtonPress(inputEventFile, lightKey, fullKey);
-
-    if (key == lightKey)
-      std::cout << "Light key touch" << std::endl;
-    else
-      std::cout << "Full key touch" << std::endl;
+    return workProcess(calibrationOnPower);
   }
 
   return 0;
@@ -212,29 +219,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Узнаем, в каком режиме нужно запуститься.
-  bool debug = config->has("debug") && config->get("debug") == "true";
-
-  // Проверяем наличие всех параметров в конфиге
-  if (!config->has("driver-path") 
-      || !config->has("event-ID") 
-      || !config->has("light-touch-key") 
-      || !config->has("full-touch-key")) {
-    std::cout << "Wrong config." << std::endl;
-    return 1;
-  }
-
   // Получаем все параметры конфига
-  std::string driverPath = config->get("driver-path");
-  if (driverPath[driverPath.length() - 1] != '/')
-    driverPath += "/";
-  int eventId = atoi(config->get("event-ID").c_str());
-  int lightKey = atoi(config->get("light-touch-key").c_str());
-  int fullKey = atoi(config->get("full-touch-key").c_str());
-
+  bool calibrationOnPower = config->has(CALIBRATION_ON_POWER_CONFIG) 
+    && config->get(CALIBRATION_ON_POWER_CONFIG) == "true";
+  
   std::cout << "Config loaded successfully." << std::endl;
 
-  int result = debug ? debugMode(driverPath, eventId, lightKey, fullKey) : workMode(driverPath, eventId, lightKey, fullKey);
+  int result = workMode(calibrationOnPower);
   
   delete config;
 
